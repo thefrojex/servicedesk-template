@@ -39,22 +39,59 @@ LANGUAGE sql STABLE AS $$
   END
 $$;
 
--- One customer by name: exact first, then a unique partial match. Null if none.
+-- A customer name the way people say it: no case, spacing, punctuation, or "Pvt Ltd"-type words.
+CREATE OR REPLACE FUNCTION __APP_SCHEMA__.name_key(t text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT regexp_replace(
+    regexp_replace(lower(coalesce(t, '')), '\m(pvt|private|ltd|limited|llp|inc|co|company|corp|corporation|the|and|m/s|ms)\M|&', ' ', 'g'),
+    '[^a-z0-9]', '', 'g')
+$$;
+
+-- One customer by name, matched the forgiving way people say names: exact first, then ignoring case
+-- / spacing / "Pvt Ltd", then a shortened or longer form ("Sharma" for Sharma Traders, "Om Sai
+-- Photostat Centre" for Om Sai Photostat), then the same first word. At each step one match wins
+-- and several ask which; null when nothing matches.
 CREATE OR REPLACE FUNCTION __APP_SCHEMA__.resolve_customer(name text) RETURNS uuid
 LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
 DECLARE
+  q text := __APP_SCHEMA__.name_key(resolve_customer.name);
+  first_word text := lower(substring(btrim(resolve_customer.name) FROM '^[^\s]+'));
+  tier integer;
   found uuid[];
   names text;
 BEGIN
-  SELECT array_agg(c.id) INTO found FROM __APP_SCHEMA__.customers c WHERE lower(c.name) = lower(btrim(resolve_customer.name));
-  IF coalesce(array_length(found, 1), 0) = 1 THEN RETURN found[1]; END IF;
-  SELECT array_agg(c.id), string_agg(c.name, ', ' ORDER BY c.name) INTO found, names
-  FROM __APP_SCHEMA__.customers c WHERE c.name ILIKE '%' || btrim(resolve_customer.name) || '%';
-  IF coalesce(array_length(found, 1), 0) = 1 THEN RETURN found[1]; END IF;
-  IF coalesce(array_length(found, 1), 0) > 1 THEN
-    RAISE EXCEPTION 'Several customers match "%": %. Which one?', resolve_customer.name, names;
-  END IF;
+  IF q = '' THEN RETURN NULL; END IF;
+  FOR tier IN 1..4 LOOP
+    SELECT array_agg(c.id), string_agg(c.name, ', ' ORDER BY c.name) INTO found, names
+    FROM __APP_SCHEMA__.customers c
+    WHERE CASE tier
+      WHEN 1 THEN lower(c.name) = lower(btrim(resolve_customer.name))
+      WHEN 2 THEN __APP_SCHEMA__.name_key(c.name) = q
+      WHEN 3 THEN length(q) >= 4 AND (__APP_SCHEMA__.name_key(c.name) LIKE '%' || q || '%'
+        OR (length(__APP_SCHEMA__.name_key(c.name)) >= 4 AND q LIKE __APP_SCHEMA__.name_key(c.name) || '%'))
+      ELSE length(first_word) >= 4 AND lower(substring(c.name FROM '^[^\s]+')) = first_word
+    END;
+    IF coalesce(array_length(found, 1), 0) = 1 THEN RETURN found[1]; END IF;
+    IF coalesce(array_length(found, 1), 0) > 1 THEN
+      RAISE EXCEPTION 'Several customers match "%": %. Which one?', resolve_customer.name, names;
+    END IF;
+  END LOOP;
   RETURN NULL;
+END $$;
+
+-- When nothing matched: the closest customer names, for the assistant to offer or pick from.
+CREATE OR REPLACE FUNCTION __APP_SCHEMA__.no_such_customer(name text) RETURNS void
+LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
+DECLARE
+  q text := __APP_SCHEMA__.name_key(no_such_customer.name);
+  closest text;
+BEGIN
+  SELECT string_agg(x.name, ', ') INTO closest FROM (
+    SELECT c.name FROM __APP_SCHEMA__.customers c
+    ORDER BY (left(__APP_SCHEMA__.name_key(c.name), 2) = left(q, 2)) DESC, (left(__APP_SCHEMA__.name_key(c.name), 1) = left(q, 1)) DESC, c.name
+    LIMIT 8) x;
+  RAISE EXCEPTION 'There''s no customer called "%". Customers include: %. If they meant one of these, use its exact name; if it really is a new customer, call again with new_customer = true.',
+    no_such_customer.name, coalesce(closest, 'none yet');
 END $$;
 
 -- An engineer by name or first name ("Ramesh").
@@ -117,12 +154,12 @@ $$;
 -- Writes (all confirmed by the person first)
 -- ---------------------------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION __APP_SCHEMA__.agent_new_complaint(customer text, problem text, machine_model text DEFAULT NULL, engineer text DEFAULT NULL)
+CREATE OR REPLACE FUNCTION __APP_SCHEMA__.agent_new_complaint(customer text, problem text, machine_model text DEFAULT NULL, engineer text DEFAULT NULL, new_customer boolean DEFAULT false)
 RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
 DECLARE
   cust uuid;
-  new_customer boolean := false;
+  created_customer boolean := false;
   machine uuid;
   eng uuid;
   c __APP_SCHEMA__.complaints;
@@ -138,8 +175,10 @@ BEGIN
 
   cust := __APP_SCHEMA__.resolve_customer(customer);
   IF cust IS NULL THEN
+    -- An unknown name is far more often an existing customer said differently than a new one
+    IF NOT coalesce(agent_new_complaint.new_customer, false) THEN PERFORM __APP_SCHEMA__.no_such_customer(customer); END IF;
     INSERT INTO __APP_SCHEMA__.customers (name) VALUES (btrim(customer)) RETURNING id INTO cust;
-    new_customer := true;
+    created_customer := true;
   END IF;
   IF btrim(coalesce(machine_model, '')) <> '' THEN
     -- "Canon 2525" is their "Canon iR 2525": the model number (and the brand, if given) is enough
@@ -166,13 +205,13 @@ BEGIN
   SELECT m.model INTO model FROM __APP_SCHEMA__.machines m WHERE m.id = machine;
   SELECT e.name INTO eng_name FROM __APP_SCHEMA__.engineers e WHERE e.id = eng;
   RETURN jsonb_build_object('message',
-    'Complaint #' || c.ticket_no || ' logged for ' || cust_name || CASE WHEN new_customer THEN ' (new customer)' ELSE '' END
+    'Complaint #' || c.ticket_no || ' logged for ' || cust_name || CASE WHEN created_customer THEN ' (new customer)' ELSE '' END
     || coalesce(' - ' || model, '') || ': ' || c.problem || '.'
     || CASE WHEN eng_name IS NOT NULL THEN ' Assigned to ' || eng_name || '.' ELSE ' Not assigned to anyone yet.' END,
     'ticket', c.ticket_no);
 END $$;
-COMMENT ON FUNCTION __APP_SCHEMA__.agent_new_complaint(text, text, text, text) IS
-  '{"description": "Log a new service complaint from a customer, optionally assigning an engineer straight away. Creates the customer if they are new - say so when confirming.", "audience": "team", "confirm": true, "params": {"customer": "Customer / company name", "problem": "What is wrong, in their words (e.g. paper jam)", "machine_model": "Machine model if mentioned, e.g. Canon 2525", "engineer": "Engineer to assign, e.g. Ramesh (optional)"}}';
+COMMENT ON FUNCTION __APP_SCHEMA__.agent_new_complaint(text, text, text, text, boolean) IS
+  '{"description": "Log a new service complaint from a customer, optionally assigning an engineer straight away. Works on an existing customer; creates one only with new_customer = true.", "audience": "team", "confirm": true, "params": {"customer": "Customer / company name", "problem": "What is wrong, in their words (e.g. paper jam)", "machine_model": "Machine model if mentioned, e.g. Canon 2525", "engineer": "Engineer to assign, e.g. Ramesh (optional)", "new_customer": "true only when they say this is a new customer; an unknown name otherwise gets back the closest existing customers"}}';
 
 CREATE OR REPLACE FUNCTION __APP_SCHEMA__.agent_assign_complaint(complaint text, engineer text) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
