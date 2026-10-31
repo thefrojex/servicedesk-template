@@ -101,7 +101,8 @@ BEGIN
   INSERT INTO __APP_SCHEMA__.amc_contracts (customer_id, machine_id, start_date, end_date, value) VALUES ((SELECT id FROM __APP_SCHEMA__.customers WHERE name = 'Bansal Medical Store'), (SELECT m.id FROM __APP_SCHEMA__.machines m JOIN __APP_SCHEMA__.customers c ON (c.id = m.customer_id) WHERE c.name = 'Bansal Medical Store' ORDER BY m.installed_on DESC OFFSET 0 LIMIT 1), today + 95 - 365, today + 95, 12000);
   INSERT INTO __APP_SCHEMA__.amc_contracts (customer_id, machine_id, start_date, end_date, value) VALUES ((SELECT id FROM __APP_SCHEMA__.customers WHERE name = 'Agarwal Textiles'), (SELECT m.id FROM __APP_SCHEMA__.machines m JOIN __APP_SCHEMA__.customers c ON (c.id = m.customer_id) WHERE c.name = 'Agarwal Textiles' ORDER BY m.installed_on DESC OFFSET 0 LIMIT 1), today + 300 - 365, today + 300, 14000);
   INSERT INTO __APP_SCHEMA__.amc_contracts (customer_id, machine_id, start_date, end_date, value) VALUES ((SELECT id FROM __APP_SCHEMA__.customers WHERE name = 'Saini Hardware'), (SELECT m.id FROM __APP_SCHEMA__.machines m JOIN __APP_SCHEMA__.customers c ON (c.id = m.customer_id) WHERE c.name = 'Saini Hardware' ORDER BY m.installed_on DESC OFFSET 0 LIMIT 1), today + 51 - 365, today + 51, 11000);
-  UPDATE __APP_SCHEMA__.settings SET demo_seeded_at = now(), business_name = 'Your Copier Service';
+  -- Every UPDATE / DELETE needs a WHERE: Supabase's safeupdate refuses them otherwise
+  UPDATE __APP_SCHEMA__.settings SET demo_seeded_at = now(), business_name = 'Your Copier Service' WHERE id;
   PERFORM set_config('app.via', '', true);
 END $$;
 REVOKE EXECUTE ON FUNCTION __APP_SCHEMA__.seed_demo() FROM PUBLIC, anon, authenticated;
@@ -113,11 +114,12 @@ BEGIN
   IF NOT __APP_SCHEMA__.is_admin() THEN
     RAISE EXCEPTION 'Only the admin can reset the demo data.' USING ERRCODE = '42501';
   END IF;
-  DELETE FROM __APP_SCHEMA__.activity_log;
-  DELETE FROM __APP_SCHEMA__.amc_contracts;
-  DELETE FROM __APP_SCHEMA__.complaints;
-  DELETE FROM __APP_SCHEMA__.machines;
-  DELETE FROM __APP_SCHEMA__.customers;
+  -- WHERE true: Supabase's safeupdate refuses a DELETE without a WHERE clause
+  DELETE FROM __APP_SCHEMA__.activity_log WHERE true;
+  DELETE FROM __APP_SCHEMA__.amc_contracts WHERE true;
+  DELETE FROM __APP_SCHEMA__.complaints WHERE true;
+  DELETE FROM __APP_SCHEMA__.machines WHERE true;
+  DELETE FROM __APP_SCHEMA__.customers WHERE true;
   DELETE FROM __APP_SCHEMA__.engineers WHERE member_user_id IS NULL;
   PERFORM __APP_SCHEMA__.seed_demo();
 END $$;
