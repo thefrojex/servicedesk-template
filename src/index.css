@@ -1,0 +1,7 @@
+/* Service Desk's design reuses the FluidCRM design tokens (src/desk/fluidcrm.css) as plain CSS.
+   Tailwind's theme and utilities are available for new UI, but not its preflight reset. */
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@import "./desk/fluidcrm.css";
+@import "./desk/app.css";
+@import "./desk/desk.css";
