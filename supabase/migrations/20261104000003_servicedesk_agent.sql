@@ -1,15 +1,13 @@
 -- What the platform's WhatsApp assistant can do in Service Desk. Platform convention: functions
 -- named agent_*, SECURITY INVOKER (they run as the person, so RLS applies), each with a JSON
--- comment { description, audience, confirm, params }; agent_whoami() returns the caller's role or
--- null. Writes tag their activity_log rows with via = 'whatsapp' and ask for a yes first.
+-- comment { description, audience, confirm, params }. agent_whoami() comes from core.link_app (the
+-- person's roles here, null for non-members). Writes tag their activity_log rows with via = 'whatsapp'.
+--
+-- Customers are the workspace's (core.parties): a customer named on WhatsApp is matched against
+-- every company the workspace knows (a CRM prospect included), never copied.
 --
 -- Engineer and customer notifications are recorded (engineer_notified_at, rating_requested_at,
 -- reminder_sent_at); sending them as WhatsApp messages needs Meta billing and approved templates.
-
-CREATE OR REPLACE FUNCTION __APP_SCHEMA__.agent_whoami() RETURNS text
-LANGUAGE sql STABLE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
-  SELECT role FROM __APP_SCHEMA__.members WHERE user_id = auth.uid() AND status = 'active'
-$$;
 
 -- ---------------------------------------------------------------------------------------------
 -- Helpers (not agent_*, so the assistant never sees them)
@@ -18,8 +16,8 @@ $$;
 CREATE OR REPLACE FUNCTION __APP_SCHEMA__.require_member() RETURNS void
 LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
 BEGIN
-  IF NOT __APP_SCHEMA__.is_active_member() THEN
-    RAISE EXCEPTION 'You don''t have access to Service Desk. Ask its admin to add you.' USING ERRCODE = '42501';
+  IF NOT core.is_app_member('__APP_SCHEMA__') THEN
+    RAISE EXCEPTION 'You don''t have access to Service Desk. Ask the workspace owner to add you.' USING ERRCODE = '42501';
   END IF;
 END $$;
 
@@ -42,9 +40,7 @@ $$;
 -- A customer name the way people say it: no case, spacing, punctuation, or "Pvt Ltd"-type words.
 CREATE OR REPLACE FUNCTION __APP_SCHEMA__.name_key(t text) RETURNS text
 LANGUAGE sql IMMUTABLE AS $$
-  SELECT regexp_replace(
-    regexp_replace(lower(coalesce(t, '')), '\m(pvt|private|ltd|limited|llp|inc|co|company|corp|corporation|the|and|m/s|ms)\M|&', ' ', 'g'),
-    '[^a-z0-9]', '', 'g')
+  SELECT replace(coalesce(core.normalize_name(t), ''), ' ', '')
 $$;
 
 -- One customer by name, matched the forgiving way people say names: exact first, then ignoring case
@@ -63,8 +59,8 @@ BEGIN
   IF q = '' THEN RETURN NULL; END IF;
   FOR tier IN 1..4 LOOP
     SELECT array_agg(c.id), string_agg(c.name, ', ' ORDER BY c.name) INTO found, names
-    FROM __APP_SCHEMA__.customers c
-    WHERE CASE tier
+    FROM core.parties c
+    WHERE c.status = 'active' AND CASE tier
       WHEN 1 THEN lower(c.name) = lower(btrim(resolve_customer.name))
       WHEN 2 THEN __APP_SCHEMA__.name_key(c.name) = q
       WHEN 3 THEN length(q) >= 4 AND (__APP_SCHEMA__.name_key(c.name) LIKE '%' || q || '%'
@@ -87,10 +83,10 @@ DECLARE
   closest text;
 BEGIN
   SELECT string_agg(x.name, ', ') INTO closest FROM (
-    SELECT c.name FROM __APP_SCHEMA__.customers c
+    SELECT c.name FROM core.parties c WHERE c.status = 'active'
     ORDER BY (left(__APP_SCHEMA__.name_key(c.name), 2) = left(q, 2)) DESC, (left(__APP_SCHEMA__.name_key(c.name), 1) = left(q, 1)) DESC, c.name
     LIMIT 8) x;
-  RAISE EXCEPTION 'There''s no customer called "%". Customers include: %. If they meant one of these, use its exact name; if it really is a new customer, call again with new_customer = true.',
+  RAISE EXCEPTION 'There''s no customer called "%" in the workspace. Companies it knows include: %. If they meant one of these, use its exact name; if it really is a new customer, call again with new_customer = true.',
     no_such_customer.name, coalesce(closest, 'none yet');
 END $$;
 
@@ -128,7 +124,7 @@ BEGIN
   cust := __APP_SCHEMA__.resolve_customer(ref);
   IF cust IS NULL THEN RAISE EXCEPTION 'No customer called "%".', ref; END IF;
   SELECT count(*) INTO n FROM __APP_SCHEMA__.complaints WHERE customer_id = cust AND status <> 'closed';
-  IF n = 0 THEN RAISE EXCEPTION '% has no pending complaint.', (SELECT name FROM __APP_SCHEMA__.customers WHERE id = cust); END IF;
+  IF n = 0 THEN RAISE EXCEPTION '% has no pending complaint.', (SELECT p.name FROM core.parties p WHERE p.id = cust); END IF;
   SELECT id INTO hit FROM __APP_SCHEMA__.complaints WHERE customer_id = cust AND status <> 'closed' ORDER BY opened_at DESC LIMIT 1;
   RETURN hit;
 END $$;
@@ -137,11 +133,11 @@ CREATE OR REPLACE FUNCTION __APP_SCHEMA__.complaint_line(c __APP_SCHEMA__.compla
 LANGUAGE sql STABLE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
   SELECT jsonb_build_object(
     'ticket', '#' || c.ticket_no,
-    'customer', (SELECT name FROM __APP_SCHEMA__.customers WHERE id = c.customer_id),
-    'area', (SELECT area FROM __APP_SCHEMA__.customers WHERE id = c.customer_id),
+    'customer', (SELECT p.name FROM core.parties p WHERE p.id = c.customer_id),
+    'area', (SELECT a.name FROM core.parties p JOIN core.areas a ON (a.id = p.area_id) WHERE p.id = c.customer_id),
     'machine', (SELECT model FROM __APP_SCHEMA__.machines WHERE id = c.machine_id),
     'problem', c.problem,
-    'engineer', (SELECT name FROM __APP_SCHEMA__.engineers WHERE id = c.engineer_id),
+    'engineer', (SELECT p.name FROM core.people p WHERE p.id = c.engineer_id),
     'status', c.status,
     'opened', to_char(c.opened_at AT TIME ZONE 'Asia/Kolkata', 'DD Mon HH24:MI'),
     'pending_for', CASE WHEN c.status <> 'closed' THEN __APP_SCHEMA__.age_text(c.opened_at) END,
@@ -177,9 +173,11 @@ BEGIN
   IF cust IS NULL THEN
     -- An unknown name is far more often an existing customer said differently than a new one
     IF NOT coalesce(agent_new_complaint.new_customer, false) THEN PERFORM __APP_SCHEMA__.no_such_customer(customer); END IF;
-    INSERT INTO __APP_SCHEMA__.customers (name) VALUES (btrim(customer)) RETURNING id INTO cust;
+    cust := (core.create_party(btrim(customer), ARRAY['customer'], p_app => '__APP_SCHEMA__') ->> 'party_id')::uuid;
     created_customer := true;
   END IF;
+  -- A company the workspace knew as a prospect becomes a customer with its first complaint
+  PERFORM core.set_party_role(cust, 'customer', true, '__APP_SCHEMA__');
   IF btrim(coalesce(machine_model, '')) <> '' THEN
     -- "Canon 2525" is their "Canon iR 2525": the model number (and the brand, if given) is enough
     SELECT m.id INTO machine FROM __APP_SCHEMA__.machines m
@@ -201,9 +199,9 @@ BEGIN
     CASE WHEN eng IS NOT NULL THEN now() END, CASE WHEN eng IS NOT NULL THEN now() END, 'whatsapp')
   RETURNING * INTO c;
 
-  SELECT name INTO cust_name FROM __APP_SCHEMA__.customers WHERE id = cust;
+  SELECT p.name INTO cust_name FROM core.parties p WHERE p.id = cust;
   SELECT m.model INTO model FROM __APP_SCHEMA__.machines m WHERE m.id = machine;
-  SELECT e.name INTO eng_name FROM __APP_SCHEMA__.engineers e WHERE e.id = eng;
+  SELECT p.name INTO eng_name FROM core.people p WHERE p.id = eng;
   RETURN jsonb_build_object('message',
     'Complaint #' || c.ticket_no || ' logged for ' || cust_name || CASE WHEN created_customer THEN ' (new customer)' ELSE '' END
     || coalesce(' - ' || model, '') || ': ' || c.problem || '.'
@@ -225,8 +223,8 @@ BEGIN
   UPDATE __APP_SCHEMA__.complaints SET engineer_id = eng, status = 'assigned', assigned_at = now(), engineer_notified_at = now()
   WHERE id = target AND status <> 'closed' RETURNING * INTO c;
   IF c.id IS NULL THEN RAISE EXCEPTION 'That complaint is already closed.'; END IF;
-  RETURN jsonb_build_object('message', 'Complaint #' || c.ticket_no || ' (' || (SELECT name FROM __APP_SCHEMA__.customers WHERE id = c.customer_id) || ') assigned to '
-    || (SELECT name FROM __APP_SCHEMA__.engineers WHERE id = eng) || '.');
+  RETURN jsonb_build_object('message', 'Complaint #' || c.ticket_no || ' (' || (SELECT p.name FROM core.parties p WHERE p.id = c.customer_id) || ') assigned to '
+    || (SELECT p.name FROM core.people p WHERE p.id = eng) || '.');
 END $$;
 COMMENT ON FUNCTION __APP_SCHEMA__.agent_assign_complaint(text, text) IS
   '{"description": "Assign (or reassign) a pending complaint to an engineer.", "audience": "team", "confirm": true, "params": {"complaint": "Ticket number (e.g. 1043) or the customer name", "engineer": "Engineer name, e.g. Suresh"}}';
@@ -235,7 +233,7 @@ CREATE OR REPLACE FUNCTION __APP_SCHEMA__.agent_close_complaint(complaint text, 
 LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path = __APP_SCHEMA__, pg_temp AS $$
 DECLARE
   target uuid := __APP_SCHEMA__.resolve_pending_complaint(complaint);
-  me_engineer uuid := (SELECT id FROM __APP_SCHEMA__.engineers WHERE member_user_id = auth.uid());
+  me_engineer uuid := (SELECT e.id FROM __APP_SCHEMA__.engineers e WHERE e.id = core.me());
   c __APP_SCHEMA__.complaints;
 BEGIN
   PERFORM __APP_SCHEMA__.require_member();
@@ -252,7 +250,7 @@ BEGIN
   WHERE id = target AND status <> 'closed' RETURNING * INTO c;
   IF c.id IS NULL THEN RAISE EXCEPTION 'That complaint is already closed.'; END IF;
   RETURN jsonb_build_object('message',
-    'Complaint #' || c.ticket_no || ' (' || (SELECT name FROM __APP_SCHEMA__.customers WHERE id = c.customer_id) || ') closed: ' || c.resolution
+    'Complaint #' || c.ticket_no || ' (' || (SELECT p.name FROM core.parties p WHERE p.id = c.customer_id) || ') closed: ' || c.resolution
     || coalesce('. Part: ' || c.part_used, '') || coalesce('. Charge: ' || __APP_SCHEMA__.inr(c.charge), '')
     || '. Took ' || __APP_SCHEMA__.age_text(c.opened_at) || ' from complaint to close.');
 END $$;
@@ -280,7 +278,7 @@ BEGIN
       AND ((a.end_date BETWEEN d AND upto) OR (include_lapsed AND a.end_date < d AND a.end_date >= d - 60))
     RETURNING a.customer_id, a.value
   )
-  SELECT count(*), sum(value), string_agg((SELECT name FROM __APP_SCHEMA__.customers WHERE id = due.customer_id), ', ') INTO n, total, names FROM due;
+  SELECT count(*), sum(value), string_agg((SELECT p.name FROM core.parties p WHERE p.id = due.customer_id), ', ') INTO n, total, names FROM due;
   IF n = 0 THEN
     RETURN jsonb_build_object('message', 'No AMCs in that period are waiting for a reminder - they''ve all been marked reminded or renewed.');
   END IF;
@@ -300,12 +298,12 @@ BEGIN
   PERFORM set_config('app.via', 'whatsapp', true);
   IF cust IS NULL THEN RAISE EXCEPTION 'No customer called "%".', customer; END IF;
   SELECT * INTO a FROM __APP_SCHEMA__.amc_contracts WHERE customer_id = cust AND renewed_at IS NULL ORDER BY end_date DESC LIMIT 1;
-  IF a.id IS NULL THEN RAISE EXCEPTION '% has no AMC to renew.', (SELECT name FROM __APP_SCHEMA__.customers WHERE id = cust); END IF;
+  IF a.id IS NULL THEN RAISE EXCEPTION '% has no AMC to renew.', (SELECT p.name FROM core.parties p WHERE p.id = cust); END IF;
   UPDATE __APP_SCHEMA__.amc_contracts SET renewed_at = now() WHERE id = a.id;
   INSERT INTO __APP_SCHEMA__.amc_contracts (customer_id, machine_id, start_date, end_date, value)
   VALUES (cust, a.machine_id, greatest(a.end_date + 1, __APP_SCHEMA__.today()), (greatest(a.end_date + 1, __APP_SCHEMA__.today()) + make_interval(months => coalesce(months, 12)))::date - 1, coalesce(new_value, a.value))
   RETURNING * INTO fresh;
-  RETURN jsonb_build_object('message', 'AMC renewed for ' || (SELECT name FROM __APP_SCHEMA__.customers WHERE id = cust) || ': ' || __APP_SCHEMA__.inr(fresh.value)
+  RETURN jsonb_build_object('message', 'AMC renewed for ' || (SELECT p.name FROM core.parties p WHERE p.id = cust) || ': ' || __APP_SCHEMA__.inr(fresh.value)
     || ', till ' || to_char(fresh.end_date, 'DD Mon YYYY') || '.');
 END $$;
 COMMENT ON FUNCTION __APP_SCHEMA__.agent_renew_amc(text, numeric, integer) IS
@@ -325,7 +323,7 @@ BEGIN
     'not_assigned', (SELECT count(*) FROM __APP_SCHEMA__.complaints WHERE status = 'open'),
     'by_engineer', coalesce((SELECT jsonb_agg(jsonb_build_object('engineer', e.name, 'pending', x.n) ORDER BY x.n DESC)
       FROM (SELECT engineer_id, count(*) AS n FROM __APP_SCHEMA__.complaints WHERE status = 'assigned' GROUP BY engineer_id) x
-      JOIN __APP_SCHEMA__.engineers e ON (e.id = x.engineer_id)), '[]'::jsonb),
+      JOIN core.people e ON (e.id = x.engineer_id)), '[]'::jsonb),
     'closed_today', (SELECT count(*) FROM __APP_SCHEMA__.complaints WHERE status = 'closed' AND closed_at >= (__APP_SCHEMA__.today()::timestamp AT TIME ZONE 'Asia/Kolkata')),
     'oldest_first', coalesce((SELECT jsonb_agg(__APP_SCHEMA__.complaint_line(c) ORDER BY c.opened_at) FROM __APP_SCHEMA__.complaints c WHERE c.status <> 'closed'), '[]'::jsonb)
   );
@@ -342,8 +340,9 @@ BEGIN
   PERFORM __APP_SCHEMA__.require_member();
   IF cust IS NULL THEN RAISE EXCEPTION 'No customer called "%".', customer; END IF;
   RETURN jsonb_build_object(
-    'customer', (SELECT name FROM __APP_SCHEMA__.customers WHERE id = cust),
-    'area', (SELECT area FROM __APP_SCHEMA__.customers WHERE id = cust),
+    'customer', (SELECT p.name FROM core.parties p WHERE p.id = cust),
+    'area', (SELECT a.name FROM core.parties p JOIN core.areas a ON (a.id = p.area_id) WHERE p.id = cust),
+    'contact', (SELECT jsonb_build_object('name', ct.name, 'phone', ct.phone_key) FROM core.contacts ct WHERE ct.party_id = cust AND ct.status = 'active' ORDER BY ct.is_primary DESC LIMIT 1),
     'machines', (SELECT jsonb_agg(m.model || coalesce(' (' || m.serial_no || ')', '')) FROM __APP_SCHEMA__.machines m WHERE m.customer_id = cust),
     'period_months', least(greatest(coalesce(months, 3), 1), 24),
     'visits', (SELECT count(*) FROM __APP_SCHEMA__.complaints WHERE customer_id = cust AND opened_at >= since),
@@ -417,11 +416,11 @@ BEGIN
     'today', d,
     'expiring', coalesce((SELECT jsonb_agg(jsonb_build_object('customer', cu.name, 'machine', m.model, 'ends', to_char(a.end_date, 'DD Mon'), 'days_left', a.end_date - d,
         'value', __APP_SCHEMA__.inr(a.value), 'reminded', a.reminder_sent_at IS NOT NULL) ORDER BY a.end_date)
-      FROM __APP_SCHEMA__.amc_contracts a JOIN __APP_SCHEMA__.customers cu ON (cu.id = a.customer_id) LEFT JOIN __APP_SCHEMA__.machines m ON (m.id = a.machine_id)
+      FROM __APP_SCHEMA__.amc_contracts a JOIN core.parties cu ON (cu.id = a.customer_id) LEFT JOIN __APP_SCHEMA__.machines m ON (m.id = a.machine_id)
       WHERE a.renewed_at IS NULL AND a.end_date BETWEEN d AND upto), '[]'::jsonb),
     'expiring_value', __APP_SCHEMA__.inr(coalesce((SELECT sum(value) FROM __APP_SCHEMA__.amc_contracts WHERE renewed_at IS NULL AND end_date BETWEEN d AND upto), 0)),
     'lapsed_not_renewed', coalesce((SELECT jsonb_agg(jsonb_build_object('customer', cu.name, 'ended', to_char(a.end_date, 'DD Mon'), 'days_ago', d - a.end_date, 'value', __APP_SCHEMA__.inr(a.value)) ORDER BY a.end_date DESC)
-      FROM __APP_SCHEMA__.amc_contracts a JOIN __APP_SCHEMA__.customers cu ON (cu.id = a.customer_id)
+      FROM __APP_SCHEMA__.amc_contracts a JOIN core.parties cu ON (cu.id = a.customer_id)
       WHERE a.renewed_at IS NULL AND a.end_date < d AND a.end_date >= d - 60), '[]'::jsonb),
     'lapsed_value', __APP_SCHEMA__.inr(coalesce((SELECT sum(value) FROM __APP_SCHEMA__.amc_contracts WHERE renewed_at IS NULL AND end_date < d AND end_date >= d - 60), 0))
   );
@@ -432,5 +431,8 @@ COMMENT ON FUNCTION __APP_SCHEMA__.agent_amc_status(text) IS
 -- Functions are executable by PUBLIC (which includes signed-out visitors) unless revoked.
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA __APP_SCHEMA__ FROM PUBLIC, anon;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA __APP_SCHEMA__ TO authenticated, service_role;
-REVOKE EXECUTE ON FUNCTION __APP_SCHEMA__.seed_demo() FROM authenticated;
 REVOKE EXECUTE ON FUNCTION __APP_SCHEMA__.log_activity() FROM authenticated;
+REVOKE EXECUTE ON FUNCTION __APP_SCHEMA__.fill_machine() FROM authenticated;
+-- The demo is loaded by the platform (as postgres), never from the app
+REVOKE EXECUTE ON FUNCTION __APP_SCHEMA__.load_demo() FROM authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION __APP_SCHEMA__.unload_demo() FROM authenticated, service_role;

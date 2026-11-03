@@ -1,5 +1,7 @@
 // Service Desk data: reads with TanStack Query straight from the app's tables (shared by the team),
-// writes as plain inserts/updates (RLS lets active members change anything, nothing is deleted).
+// writes as plain inserts/updates (RLS lets members change anything, nothing is deleted).
+// Customers and engineers are the workspace's (core): read through customer_list and engineers,
+// and a customer is saved with save_customer, which creates or finds the shared record.
 //
 // Live updates: every change anywhere - this screen, another member, the WhatsApp assistant - writes
 // an activity_log row. useLiveActivity listens for those over Supabase Realtime (plus a 15-second
@@ -31,7 +33,7 @@ export const useComplaints = () =>
     queryKey: keys.complaints,
     queryFn: async () => fail(await supabase
       .from('complaints')
-      .select('id, ticket_no, problem, category, status, opened_at, assigned_at, closed_at, resolution, part_used, charge, created_via, rating_requested_at, customer:customers (id, name, area), machine:machines (id, model), engineer:engineers (id, name)')
+      .select('id, ticket_no, problem, category, status, opened_at, assigned_at, closed_at, resolution, part_used, charge, created_via, rating_requested_at, customer:customer_list (id, name, area), machine:machines (id, model), engineer:engineers!engineer_id (id, name)')
       .order('opened_at', { ascending: false })
       .limit(500)),
   })
@@ -40,7 +42,7 @@ export const useCustomers = () =>
   useQuery({
     queryKey: keys.customers,
     queryFn: async () => fail(await supabase
-      .from('customers')
+      .from('customer_list')
       .select('id, name, area, contact_person, phone, machines (id, model, serial_no, installed_on)')
       .order('name')),
   })
@@ -48,7 +50,7 @@ export const useCustomers = () =>
 export const useEngineers = () =>
   useQuery({
     queryKey: keys.engineers,
-    queryFn: async () => fail(await supabase.from('engineers').select('id, name, phone, active, member_user_id').order('name')),
+    queryFn: async () => fail(await supabase.from('engineers').select('id, name, phone, title, active').order('name')),
   })
 
 export const useAmcs = () =>
@@ -56,14 +58,18 @@ export const useAmcs = () =>
     queryKey: keys.amc,
     queryFn: async () => fail(await supabase
       .from('amc_contracts')
-      .select('id, start_date, end_date, value, reminder_sent_at, renewed_at, customer:customers (id, name, area), machine:machines (id, model)')
+      .select('id, start_date, end_date, value, reminder_sent_at, renewed_at, customer:customer_list (id, name, area), machine:machines (id, model)')
       .order('end_date')),
   })
 
+// The business itself is the workspace's (core), changed in the console
 export const useSettings = () =>
   useQuery({
     queryKey: keys.settings,
-    queryFn: async () => fail(await supabase.from('settings').select('business_name').maybeSingle()),
+    queryFn: async () => {
+      const row = fail(await supabase.from('organisation').select('name').maybeSingle())
+      return { business_name: row?.name ?? 'Your service business' }
+    },
   })
 
 // Ids this tab changed recently, so their log entries aren't shown as someone else's change.
@@ -79,6 +85,15 @@ export function useSave(table) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, values }) => {
+      if (table === 'customers') {
+        // A name the workspace already has comes back as that same customer
+        const saved = fail(await supabase.rpc('save_customer', {
+          p_party_id: id ?? crypto.randomUUID(), p_name: values.name, p_area: values.area ?? null,
+          p_contact_person: values.contact_person ?? null, p_phone: values.phone ?? null,
+        }))
+        rememberOwn(saved)
+        return { id: saved, ...values }
+      }
       if (id) {
         rememberOwn(id)
         return fail(await supabase.from(table).update(values).eq('id', id).select().single())
@@ -91,13 +106,6 @@ export function useSave(table) {
   })
 }
 
-export const useSaveSettings = () => {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: async (values) => fail(await supabase.from('settings').update(values).eq('id', true)),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: keys.settings }),
-  })
-}
 
 // Recent changes to one complaint, newest first (its history panel).
 export const useComplaintHistory = (complaintId) =>

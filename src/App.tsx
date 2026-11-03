@@ -8,7 +8,8 @@ import TeamPage from "./desk/TeamPage.jsx";
 import { useAuthUser, useMembership } from "./desk/session.js";
 
 // Service Desk: sign in (workspace login) → this app's member list decides access → the team's
-// shared complaints, customers and AMCs. The first person to sign in becomes its admin.
+// shared complaints, customers and AMCs. Membership and roles are the workspace's (core); the
+// workspace owner is always its admin.
 
 function Centered({ children }: { children: string }) {
   return (
@@ -28,7 +29,7 @@ function App() {
   if (membership.error) return <Centered>{`Couldn't open Service Desk: ${membership.error.message}`}</Centered>;
 
   const member = membership.data;
-  if (!member || member.status !== "active") return <NoAccess email={auth.user.email} disabled={member?.status === "disabled"} />;
+  if (!member) return <NoAccess email={auth.user.email} />;
 
   const accountMenu = <AccountMenu member={member} />;
   return (

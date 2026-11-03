@@ -1,7 +1,7 @@
-// Who is signed in, and what they are in this CRM. Sign-in is the workspace's Supabase Auth (the
-// same logins as every app in the workspace, and the workspace portal signs people in here too);
-// membership is this app's own list. desk_session_seeded() makes the first sign-in the admin and
-// loads the demo data for the whole team.
+// Who is signed in, and what they are in the Service Desk. Sign-in is the workspace's Supabase Auth (the
+// same logins as every app in the workspace, and the workspace portal signs people in here too).
+// Who may use the CRM, and with which roles, is the workspace's: core keeps the members, and
+// desk_session() answers for the signed-in person (null = not a member).
 
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -22,22 +22,11 @@ export function useMembership(userId) {
     queryKey: ['desk', 'session', userId],
     enabled: Boolean(userId),
     queryFn: async () => {
-      const { data, error } = await supabase.rpc('desk_session_seeded')
+      const { data, error } = await supabase.rpc('desk_session')
       if (error) throw error
       return data // null = not a member
     },
     staleTime: 60000,
-  })
-}
-
-export function useResetDemo() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: async () => {
-      const { error } = await supabase.rpc('reset_demo')
-      if (error) throw error
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['desk'] }),
   })
 }
 
@@ -46,44 +35,49 @@ export async function signOut(queryClient) {
   queryClient.clear()
 }
 
-// ---------- the admin's member list (writes go through the edge function) ----------
+// ---------- the Service Desk's members, kept in the workspace's shared data ----------
 
-const usersFunction = `${import.meta.env.VITE_SUPABASE_SCHEMA}-users`
 const membersKey = ['desk', 'members']
+const peopleKey = ['desk', 'people']
 
+// Everyone in the Service Desk with their roles here (the workspace owner always, as admin)
 export function useMembers() {
   return useQuery({
     queryKey: membersKey,
     queryFn: async () => {
-      const { data, error } = await supabase
-        .from('members')
-        .select('user_id, email, name, role, status, created_login, created_at')
-        .order('created_at')
+      const { data, error } = await supabase.from('members').select('id, auth_user_id, name, email, title, workspace_role, roles').order('name')
       if (error) throw error
       return data
     },
   })
 }
 
-async function callUsersFunction(body) {
-  const { data, error } = await supabase.functions.invoke(usersFunction, { body })
-  if (error) {
-    // The function answers { error } with a 4xx; surface that message, not "non-2xx status"
-    const detail = await error.context?.json?.().catch(() => null)
-    throw new Error(detail?.error ?? error.message)
-  }
-  return data
-}
-
-export function useMemberAction() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: callUsersFunction,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: membersKey }),
+// The workspace's employees, to add from
+export function usePeople() {
+  return useQuery({
+    queryKey: peopleKey,
+    queryFn: async () => {
+      const { data, error } = await supabase.from('people').select('id, name, email, title').eq('status', 'active').order('name')
+      if (error) throw error
+      return data
+    },
   })
 }
 
-// A member whose login this CRM created should replace the temporary password.
+// Add or remove a member, and set their roles here: { personId, roles, active }
+export function useSetMember() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ personId, roles = [], active = true }) => {
+      const { error } = await supabase.rpc('set_member', { p_person_id: personId, p_roles: roles, p_active: active })
+      if (error) throw error
+    },
+    // the engineers list follows the engineer role
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['desk'] }),
+  })
+}
+
+// Their workspace login's password: it changes for every app in the workspace.
 export async function changePassword(password) {
   const { error } = await supabase.auth.updateUser({ password })
   if (error) throw error
